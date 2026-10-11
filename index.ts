@@ -5,6 +5,7 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import crypto from "node:crypto";
 
 type ProviderApi = "openai-completions" | "anthropic-messages";
 type ProviderStyle = "openai" | "anthropic" | "ollama";
@@ -48,24 +49,90 @@ const MODELS_JSON_PATH = (IS_OMP ? ["models.yml", "models.yaml", "models.json"] 
 	.map((name) => join(AGENT_DIR, name))
 	.find(existsSync) ?? join(AGENT_DIR, IS_OMP ? "models.yml" : "models.json");
 const IS_YAML_CONFIG = /\.ya?ml$/i.test(MODELS_JSON_PATH);
-const BUILTIN_PROVIDER_IDS = new Set([
-	"anthropic",
-	"openai",
-	"azure-openai",
-	"google",
-	"vertex",
-	"bedrock",
-	"mistral",
-	"groq",
-	"cerebras",
-	"xai",
-	"openrouter",
-	"vercel-ai-gateway",
-	"zai",
-	"huggingface",
-	"kimi-for-coding",
-	"minimax",
-	"ollama",
+const BUILTIN_PROVIDER_IDS: Record<string, true> = {
+	anthropic: true,
+	openai: true,
+	"azure-openai": true,
+	google: true,
+	vertex: true,
+	bedrock: true,
+	mistral: true,
+	groq: true,
+	cerebras: true,
+	xai: true,
+	openrouter: true,
+	"vercel-ai-gateway": true,
+	zai: true,
+	huggingface: true,
+	"kimi-for-coding": true,
+	minimax: true,
+	ollama: true,
+};
+
+// ── OpenCode Free tier ────────────────────────────────────────────────────────
+
+const OPENCODE_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+// Generate canonical ses_<12hex><14base62> session ID (mirrors 9router opencode-zen).
+function generateOpenCodeSessionId(timestamp = Date.now()) {
+	const current = BigInt(timestamp) * 0x1000n + 1n;
+	const value = ~current;
+	const time = Array.from({ length: 6 }, (_, index) =>
+		Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+			.toString(16)
+			.padStart(2, "0"),
+	).join("");
+	const bytes = crypto.randomBytes(14);
+	let randomPart = "";
+	for (let i = 0; i < 14; i++) {
+		randomPart += OPENCODE_BASE62[bytes[i] % 62];
+	}
+	return `ses_${time}${randomPart}`;
+}
+
+// Probe /zen/v1/models and return only free-tier model IDs (id ends with "-free").
+// Skips responses-only models (muse-spark-contributor) and systemone (jev).
+const OPENCODE_ZEN_ENDPOINT = "https://opencode.ai/zen/v1";
+
+async function probeOpenCodeFreeModels(): Promise<string[]> {
+	try {
+		const res = await fetch(`${OPENCODE_ZEN_ENDPOINT}/models`, {
+			signal: AbortSignal.timeout(10_000),
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const json: unknown = await res.json();
+		const ids: string[] = [];
+		if (json && typeof json === "object" && "data" in json) {
+			const data = (json as Record<string, unknown>).data;
+			if (Array.isArray(data)) {
+				for (const item of data) {
+					if (item && typeof item === "object" && "id" in item) {
+						const id = (item as Record<string, unknown>).id;
+						if (typeof id === "string") ids.push(id);
+					}
+				}
+			}
+		}
+		return ids
+			.filter((id) => id.endsWith("-free"))
+			.filter((id) => !id.startsWith("muse-spark") && !id.startsWith("jev-"))
+			.sort((a, b) => a.localeCompare(b));
+	} catch {
+		return [];
+	}
+}
+
+// Well-known free model IDs used as defaults when probe succeeds but user may
+// uncheck them, or as fallback when probe fails.
+const OPENCODE_FREE_DEFAULTS: ReadonlySet<string> = new Set([
+	"mimo-v2.6-flash-free",
+	"step-5-preview-free",
+	"space-bunny-free",
+	"longcat-2.5-preview-free",
+	"ling-3.0-flash-fin-free",
+	"ling-3.1-flash-free",
+	"nemotron-3-ultra-free",
+	"nemotron-3.5-lightning-free",
 ]);
 
 function ensureConfigDir() {
@@ -906,7 +973,7 @@ async function renameProvider(ctx: CommandContext, providerId: string): Promise<
 		return null;
 	}
 
-	if (BUILTIN_PROVIDER_IDS.has(newId)) {
+	if (newId in BUILTIN_PROVIDER_IDS) {
 		const ok = await ctx.ui.confirm(
 			"Override built-in provider?",
 			`"${newId}" matches a built-in provider id. Saving this will override that provider in the active models config. Continue?`,
@@ -1453,6 +1520,80 @@ async function persistProvider(ctx: CommandContext, providerId: string, provider
 	return true;
 }
 
+// ── OpenCode Free tier flow ───────────────────────────────────────────────────
+
+async function addOpenCodeFreeFlow(ctx: CommandContext) {
+	// Generate canonical session ID once; saved as static header.
+	const sessionId = generateOpenCodeSessionId();
+
+	// Prompt for a provider name; suggest opencode-free.
+	let existingIds = new Set<string>();
+	try {
+		existingIds = new Set(Object.keys(loadModelsConfig().providers ?? {}));
+	} catch {
+		// persistProvider surfaces errors later.
+	}
+
+	const suggestion = existingIds.has("opencode-free") ? "opencode-free-2" : "opencode-free";
+	const providerNameInput = await ctx.ui.input(
+		`Provider name (blank = ${suggestion})`,
+		"e.g. opencode-free",
+	);
+	if (providerNameInput === undefined) return;
+	const providerId = slugify(providerNameInput.trim() || suggestion);
+	if (!providerId) return;
+
+	if (existingIds.has(providerId)) {
+		ctx.ui.notify(`Provider "${providerId}" already exists. Choose a different name.`, "warning");
+		return;
+	}
+
+	// Probe live models, filter free-tier.
+	ctx.ui.notify("Probing OpenCode Zen models…", "info");
+	const freeIds = await probeOpenCodeFreeModels();
+
+	if (freeIds.length === 0) {
+		ctx.ui.notify("No free models found at /zen/v1/models. The endpoint may be unavailable. Try again later.", "error");
+		return;
+	}
+
+	// Show multi-select picker with well-known defaults pre-selected.
+	const selected = await pickMany(
+		ctx,
+		`Free models (${freeIds.length} available)`,
+		freeIds.map((id) => ({
+			value: id,
+			label: id,
+			description: OPENCODE_FREE_DEFAULTS.has(id) ? "Known free model (pre-selected)" : undefined,
+		})),
+	);
+	if (!selected || selected.length === 0) return;
+
+	// Build provider config with free-tier fingerprint headers.
+	// Provider config shape: { baseUrl, api, apiKey?, headers?, models[] }.
+	const config: Record<string, unknown> = {
+		baseUrl: OPENCODE_ZEN_ENDPOINT,
+		api: "openai-completions",
+		apiKey: "public",
+		headers: {
+			"User-Agent": "opencode/1.18.31",
+			"x-opencode-client": "desktop",
+			"x-opencode-project": "global",
+			"x-opencode-session": sessionId,
+		},
+		models: selected.map((id) => ({
+			id,
+			input: ["text", "image"],
+			reasoning: true,
+			thinkingLevelMap: { xhigh: "xhigh" },
+		})),
+	};
+
+	if (!(await persistProvider(ctx, providerId, config))) return;
+	ctx.ui.notify(`Saved OpenCode Free provider "${providerId}" (${selected.length} models) to ${MODELS_JSON_PATH}`, "info");
+	ctx.ui.notify("Open /model to select a free model.", "info");
+}
+
 async function addProviderFlow(ctx: CommandContext) {
 	const styleChoice = await promptProviderStyle(ctx);
 	if (!styleChoice) return;
@@ -1535,8 +1676,17 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 	pi.registerCommand("better-custom", {
 		description: "Wizard for adding, editing, or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
-			const action = await selectOne(ctx, "Better custom", ["Add provider", "Edit provider", "Delete provider"]);
+			const action = await selectOne(ctx, "Better custom", [
+				"Add provider",
+				"Add OpenCode Free",
+				"Edit provider",
+				"Delete provider",
+			]);
 			if (!action) return;
+			if (action === "Add OpenCode Free") {
+				await addOpenCodeFreeFlow(ctx);
+				return;
+			}
 			if (action === "Edit provider") {
 				await editProviderFlow(ctx);
 				return;
