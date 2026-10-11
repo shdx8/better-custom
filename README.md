@@ -23,6 +23,8 @@ A better way to add custom providers for Pi and Oh My Pi (OMP).
   models receive images instead of having them silently dropped
 - Reasoning enabled by default at the `xhigh` ceiling for newly added models
 - Safe delete flow for whole providers or individual models
+- API key rings (OMP only) — give several keys to one provider; OMP round-robins
+  between them automatically, with an optional name label per key
 
 ## Install
 
@@ -56,7 +58,7 @@ The wizard can:
 
 Guides you through:
 
-- provider style (OpenAI / Anthropic / Ollama)
+- provider style (OpenCode Free / OpenAI / Anthropic / Ollama)
 - endpoint
 - provider name (must be unique)
 - API key method (API key or none)
@@ -64,6 +66,15 @@ Guides you through:
 
 Newly added models default to `input: ["text", "image"]` and `reasoning: true`
 at the `xhigh` ceiling. Tune any of this later via Edit provider.
+
+Choosing **OpenCode Free** as the style skips the endpoint, name, key, and model
+steps and instead probes OpenCode Zen for free-tier models:
+
+- Prompts for a provider name (defaults to `opencode-free`)
+- Probes `https://opencode.ai/zen/v1/models` and keeps only `*-free` model ids
+- Multi-select picker with known free models pre-selected
+- Writes the free-tier fingerprint headers (user agent, `x-opencode-*`, and a
+  generated `ses_…` session id)
 
 ### Edit a provider
 
@@ -80,9 +91,25 @@ Pick a provider, then choose:
   - Delete this model
 - Add models manually
 - Rename provider — change the provider name (key) in the active models config
+- Manage API keys (OMP only) — see the Key Ring section below
 
 Per-model edits change one field in place, so untouched fields (cost, headers,
 overrides) are preserved.
+
+### Manage API keys (Key Ring, OMP only)
+
+When editing a provider under Oh My Pi, pick **Manage API keys** to add or remove
+extra API keys for that provider:
+
+- **Add** prompts for a name label (e.g. `Akun 1`, `Work`) then the key itself.
+  Keys are stored in OMP's credential store (`agent.db`), not in the models
+  config.
+- Registered keys are listed by their label with a masked preview
+  (`sk-a…b`). Selecting one deletes it after confirmation.
+
+OMP loads every active key for a provider and round-robins between them, so
+adding a second key spreads requests across accounts without any proxy or
+restart. The count of active keys also shows next to the menu entry.
 
 ### Delete a provider
 

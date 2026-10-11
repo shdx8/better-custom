@@ -918,12 +918,30 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 		}
 
 		const modelCount = Array.isArray(provider.models) ? provider.models.length : 0;
+
+		// Cek apakah provider punya credential di OMP store
+		let keySummary = "";
+		if (IS_OMP) {
+			try {
+				const dbPath = join(AGENT_DIR, "agent.db");
+				if (existsSync(dbPath)) {
+					const sqliteMod = await import("bun:sqlite");
+					const db: InstanceType<(typeof sqliteMod)["Database"]> = new sqliteMod.Database(dbPath);
+					const count = (
+						db.query("SELECT COUNT(*) as cnt FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL").get(providerId) as { cnt: number } | undefined
+					)?.cnt ?? 0;
+					keySummary = count > 0 ? ` • ${count} key terdaftar` : "";
+				}
+			} catch {/* credential store tidak tersedia */}
+		}
+
 		const action = await selectOne(ctx, `Edit ${providerId}`, [
 			{ value: "probe", label: "Re-probe for new models", description: "Query /models again and add ones not already configured" },
 			{ value: "context", label: "Set context window (all models)", description: `Apply one contextWindow to all ${modelCount} model${modelCount === 1 ? "" : "s"}` },
 			{ value: "models", label: "Edit per model", description: `${modelCount} model${modelCount === 1 ? "" : "s"} — reasoning, vision, context, max tokens, headers, delete` },
 			{ value: "add", label: "Add models manually", description: "Type model ids to add" },
 			{ value: "rename", label: "Rename provider", description: "Change the provider name in the models config" },
+			...(IS_OMP ? [{ value: "keys", label: "Manage API keys", suffix: keySummary, description: "Add or remove API keys for round-robin" }] : []),
 			{ value: "back", label: "Back", description: "Return to the provider list" },
 		]);
 		if (!action || action === "back") return;
@@ -940,6 +958,8 @@ async function editSingleProvider(ctx: CommandContext, providerId: string) {
 			// Reassign so the menu keeps editing the same provider under its new name.
 			const renamed = await renameProvider(ctx, providerId);
 			if (renamed) providerId = renamed;
+		} else if (action === "keys") {
+			await manageProviderKeyRing(ctx, providerId);
 		}
 	}
 }
@@ -1387,15 +1407,21 @@ async function deleteProviderFlow(ctx: CommandContext) {
 	}
 }
 
+type StyleChoice =
+	| { kind: "opencode-free" }
+	| { kind: "standard"; style: ProviderStyle; api: ProviderApi };
+
 async function promptProviderStyle(
 	ctx: CommandContext,
-): Promise<{ style: ProviderStyle; api: ProviderApi } | null> {
+): Promise<StyleChoice | null> {
 	const providerStyleLabel = await selectOne(ctx, "Provider style", [
 		"OpenAI-compatible",
 		"Anthropic-compatible",
 		"Ollama-compatible",
+		"OpenCode Free",
 	]);
 	if (!providerStyleLabel) return null;
+	if (providerStyleLabel === "OpenCode Free") return { kind: "opencode-free" };
 
 	const style: ProviderStyle =
 		providerStyleLabel === "Anthropic-compatible"
@@ -1404,7 +1430,7 @@ async function promptProviderStyle(
 				? "ollama"
 				: "openai";
 	const api: ProviderApi = style === "anthropic" ? "anthropic-messages" : "openai-completions";
-	return { style, api };
+	return { kind: "standard", style, api };
 }
 
 async function promptEndpoint(
@@ -1482,7 +1508,7 @@ async function promptProviderId(ctx: CommandContext, normalizedEndpoint: string)
 			continue;
 		}
 
-		if (BUILTIN_PROVIDER_IDS.has(providerId)) {
+		if (BUILTIN_PROVIDER_IDS[providerId]) {
 			const ok = await ctx.ui.confirm(
 				"Override built-in provider?",
 				`"${providerId}" matches a built-in provider id. Saving this will override that provider in the active models config. Continue?`,
@@ -1597,6 +1623,10 @@ async function addOpenCodeFreeFlow(ctx: CommandContext) {
 async function addProviderFlow(ctx: CommandContext) {
 	const styleChoice = await promptProviderStyle(ctx);
 	if (!styleChoice) return;
+	if (styleChoice.kind === "opencode-free") {
+		await addOpenCodeFreeFlow(ctx);
+		return;
+	}
 	const { style, api } = styleChoice;
 
 	const endpoint = await promptEndpoint(ctx, style, api);
@@ -1634,6 +1664,116 @@ async function addProviderFlow(ctx: CommandContext) {
 
 	ctx.ui.notify(`Saved provider \"${providerId}\" to ${MODELS_JSON_PATH}`, "info");
 	ctx.ui.notify("Open /model to use your new provider.", "info");
+}
+
+// ── Provider-scoped Key Ring management (inside Edit provider) ─────────────────
+
+async function manageProviderKeyRing(ctx: CommandContext, providerId: string): Promise<void> {
+	if (!IS_OMP) {
+		ctx.ui.notify("Key Ring requires Oh My Pi.", "error");
+		return;
+	}
+
+	const dbPath = join(AGENT_DIR, "agent.db");
+	if (!existsSync(dbPath)) {
+		ctx.ui.notify("agent.db not found. Make sure OMP is installed and has been run at least once.", "error");
+		return;
+	}
+
+	// Dynamic import: bun:sqlite only exists in the Bun runtime (OMP); it fails in Node.js (pi)
+	const sqliteMod = await import("bun:sqlite");
+	type BunDB = InstanceType<(typeof sqliteMod)["Database"]>;
+	const db: BunDB = new sqliteMod.Database(dbPath);
+
+	// Loop key ring management for this specific provider
+	for (;;) {
+		type CredRow = { id: number; credential_type: string; data: string; disabled_cause: string | null };
+		const rows = db.query(
+			"SELECT id, credential_type, data, disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id",
+		).all(providerId) as CredRow[];
+
+		const activeRows = rows.filter((r) => r.disabled_cause === null);
+		const menuItems: SelectItem[] = [{ value: "add", label: "Add API key", description: "Register a new API key" }];
+
+		if (activeRows.length > 0) {
+			for (const row of activeRows) {
+				let displayName = `Key #${row.id}`;
+				let keyPreview = "****";
+				try {
+					const parsed = JSON.parse(row.data);
+					if (typeof parsed.name === "string" && parsed.name.trim()) {
+						displayName = parsed.name.trim();
+					}
+					const rawKey = typeof parsed.key === "string" ? parsed.key : row.data;
+					keyPreview = rawKey.length <= 8 ? "****" : `${rawKey.slice(0, 4)}...${rawKey.slice(-4)}`;
+				} catch { /* fallback */ }
+				menuItems.push({
+					value: `del:${row.id}`,
+					label: `Delete ${displayName}`,
+					suffix: ` • ${keyPreview}`,
+				});
+			}
+		}
+
+		menuItems.push({ value: "done", label: "Done", description: "Return to the Edit provider menu" });
+
+		const summary = activeRows.length > 0 ? `${activeRows.length} active key${activeRows.length === 1 ? "" : "s"}` : "No keys yet";
+		const choice = await selectOne(ctx, `${providerId} — ${summary}`, menuItems);
+		if (!choice || choice === "done") return;
+
+		if (choice === "add") {
+			const nameInput = await ctx.ui.input("Key label", "e.g. Account 1, Work, Personal");
+			if (!nameInput) continue;
+			const labelName = nameInput.trim();
+			if (!labelName) continue;
+
+			const keyInput = await ctx.ui.input("API key", "sk-... or an API token");
+			if (!keyInput) continue;
+			const trimmedKey = keyInput.trim();
+			if (!trimmedKey) continue;
+
+			try {
+				db.run(
+					`INSERT INTO auth_credentials (provider, credential_type, data) VALUES (?, 'api_key', ?)`,
+					[providerId, JSON.stringify({ key: trimmedKey, source: "extension", name: labelName })],
+				);
+				db.run("UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1");
+				ctx.ui.notify(`Key "${labelName}" added to ${providerId}`, "success");
+			} catch (err) {
+				ctx.ui.notify(`Failed to save key: ${err instanceof Error ? err.message : String(err)}`, "error");
+			}
+			continue;
+		}
+
+		if (choice.startsWith("del:")) {
+			const id = Number(choice.slice(4));
+			if (Number.isNaN(id)) continue;
+
+			// Look up the key label for the confirmation prompt
+			const targetRow = rows.find((r) => r.id === id);
+			let confirmName = `Key #${id}`;
+			if (targetRow) {
+				try {
+					const parsed = JSON.parse(targetRow.data);
+					if (typeof parsed.name === "string" && parsed.name.trim()) {
+						confirmName = parsed.name.trim();
+					}
+				} catch { /* fallback */ }
+			}
+
+			const ok = await ctx.ui.confirm("Delete key?", `Delete "${confirmName}" from ${providerId}?`);
+			if (!ok) continue;
+
+			try {
+				db.run("DELETE FROM auth_credentials WHERE id = ?", [id]);
+				db.run("UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1");
+				ctx.ui.notify(`Deleted "${confirmName}" from ${providerId}`, "info");
+			} catch (err) {
+				ctx.ui.notify(`Failed to delete key: ${err instanceof Error ? err.message : String(err)}`, "error");
+			}
+			continue;
+		}
+	}
 }
 
 async function collectModelIds(
@@ -1678,15 +1818,10 @@ export default function betterCustomWizard(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const action = await selectOne(ctx, "Better custom", [
 				"Add provider",
-				"Add OpenCode Free",
 				"Edit provider",
 				"Delete provider",
 			]);
 			if (!action) return;
-			if (action === "Add OpenCode Free") {
-				await addOpenCodeFreeFlow(ctx);
-				return;
-			}
 			if (action === "Edit provider") {
 				await editProviderFlow(ctx);
 				return;
