@@ -71,10 +71,16 @@ Choosing **OpenCode Free** as the style skips the endpoint, name, key, and model
 steps and instead probes OpenCode Zen for free-tier models:
 
 - Prompts for a provider name (defaults to `opencode-free`)
-- Probes `https://opencode.ai/zen/v1/models` and keeps only `*-free` model ids
+- Probes `https://opencode.ai/inference/v1/models` and keeps only `*-free` model ids
 - Multi-select picker with known free models pre-selected
 - Writes the free-tier fingerprint headers (user agent, `x-opencode-*`, and a
   generated `ses_…` session id)
+- Applies the lane's real per-model limits and effort sets for known free ids
+  (`deepseek-v4.1-flash-free` 330k window / `low|high|max`;
+  `mimo-v2.6-flash-free` full enum incl. `max`; `glm-5.3-flash-free` 1M window)
+- Registers a request hook that stamps the CLI `<env>` block into the system
+  prompt and guarantees `read` + `shell` tool declarations — without both halves
+  the gateway answers `429 FreeUsageLimitError` even with correct headers
 
 ### Edit a provider
 

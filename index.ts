@@ -2,7 +2,8 @@ import * as CodingAgent from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import crypto from "node:crypto";
@@ -90,13 +91,37 @@ function generateOpenCodeSessionId(timestamp = Date.now()) {
 	return `ses_${time}${randomPart}`;
 }
 
-// Probe /zen/v1/models and return only free-tier model IDs (id ends with "-free").
+// Probe /models and return only free-tier model IDs (id ends with "-free").
 // Skips responses-only models (muse-spark-contributor) and systemone (jev).
-const OPENCODE_ZEN_ENDPOINT = "https://opencode.ai/zen/v1";
+// 2026-10: free inference moved from /zen/v1 to /inference/v1 and the gateway
+// gates on a v2-shaped fingerprint (see opencodeFreeHeaders below).
+const OPENCODE_ZEN_ENDPOINT = "https://opencode.ai/inference/v1";
+const OPENCODE_FREE_BASE_URL_RE = /^https?:\/\/opencode\.ai\//i;
 
-async function probeOpenCodeFreeModels(): Promise<string[]> {
+// Live fingerprint requirements (2026-10-14, verified by live probes):
+// - UA must be present; any opencode version string passes (v1 included).
+// - x-opencode-request must NOT be sent (upstream rejects it).
+// - session ids must decode as ~(ms*0x1000 + smallCounter), any age passes.
+// - request body must stream (stream:true) and must declare lowercase `read`
+//   and `shell` tools with non-empty parameter properties.
+const OPENCODE_FREE_UA = "opencode/latest/2.0.29/cli";
+
+function opencodeFreeHeaders(sessionId: string): Record<string, string> {
+	return {
+		"User-Agent": OPENCODE_FREE_UA,
+		"x-opencode-client": "cli",
+		"x-opencode-project": "global",
+		"x-opencode-session": sessionId,
+		"x-opencode-session-id": sessionId,
+		"x-session-affinity": sessionId,
+		"x-session-id": sessionId,
+	};
+}
+
+async function probeOpenCodeFreeModels(sessionId: string): Promise<string[]> {
 	try {
 		const res = await fetch(`${OPENCODE_ZEN_ENDPOINT}/models`, {
+			headers: opencodeFreeHeaders(sessionId),
 			signal: AbortSignal.timeout(10_000),
 		});
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -134,6 +159,41 @@ const OPENCODE_FREE_DEFAULTS: ReadonlySet<string> = new Set([
 	"nemotron-3-ultra-free",
 	"nemotron-3.5-lightning-free",
 ]);
+
+// Reasoning levels the free lane actually serves, ported from 9router probes:
+// deepseek-v4.1-flash-free answers low|high|max only (313559f) and
+// mimo-v2.6-flash-free takes the full OpenAI enum (b833128). 9router's other
+// ports already hold here: omp reads `reasoning`/`reasoning_details` aliases,
+// and its OpenAI-compatible lane always sends `reasoning_effort` (never the zai
+// `thinking` object), which is what glm-5.3-flash-free needs (32c5f30).
+// deepseek also rejects prompts above ~330k tokens (1da5b0d), and clients
+// compact from the published window, so the window is capped.
+type OpenCodeFreeCaps = {
+	contextWindow: number;
+	maxTokens: number;
+	efforts: ("minimal" | "low" | "medium" | "high" | "xhigh" | "max")[];
+	defaultLevel: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+};
+const OPENCODE_FREE_MODEL_CAPS: Readonly<Record<string, OpenCodeFreeCaps>> = {
+	"deepseek-v4.1-flash-free": {
+		contextWindow: 330000,
+		maxTokens: 128000,
+		efforts: ["low", "high", "max"],
+		defaultLevel: "high",
+	},
+	"mimo-v2.6-flash-free": {
+		contextWindow: 1048576,
+		maxTokens: 131072,
+		efforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+		defaultLevel: "xhigh",
+	},
+	"glm-5.3-flash-free": {
+		contextWindow: 1000000,
+		maxTokens: 128000,
+		efforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+		defaultLevel: "high",
+	},
+};
 
 function ensureConfigDir() {
 	mkdirSync(dirname(MODELS_JSON_PATH), { recursive: true });
@@ -768,6 +828,18 @@ function buildModelEntry(id: string, opts: ModelOptions, providerStringOverride?
 	return entry;
 }
 
+// OpenCode Free entries carry the per-model limits and effort set the lane
+// actually serves; unknown free ids keep the generic xhigh default.
+function buildOpenCodeFreeModelEntry(id: string): any {
+	const entry = buildModelEntry(id, { reasoning: "xhigh", vision: true });
+	const caps = OPENCODE_FREE_MODEL_CAPS[id];
+	if (!caps) return entry;
+	entry.contextWindow = caps.contextWindow;
+	entry.maxTokens = caps.maxTokens;
+	entry.thinking = { mode: "effort", efforts: caps.efforts, defaultLevel: caps.defaultLevel };
+	return entry;
+}
+
 function buildProviderConfig(
 	style: ProviderStyle,
 	api: ProviderApi,
@@ -1269,8 +1341,10 @@ function apiKeyFromProvider(provider: any): { mode: ApiKeyMode; value?: string }
 
 async function addModelEntriesToProvider(ctx: CommandContext, providerId: string, ids: string[]) {
 	const existing = new Set<string>();
+	let openCodeFree = false;
 	try {
 		const provider = loadModelsConfig().providers?.[providerId];
+		openCodeFree = typeof provider?.baseUrl === "string" && OPENCODE_FREE_BASE_URL_RE.test(provider.baseUrl);
 		for (const m of Array.isArray(provider?.models) ? provider.models : []) existing.add(modelIdOf(m));
 	} catch {
 		// fall through; mutateProvider re-reads and reports errors
@@ -1285,7 +1359,9 @@ async function addModelEntriesToProvider(ctx: CommandContext, providerId: string
 	// model later via Edit provider → Edit a model.
 	const saved = await mutateProvider(ctx, providerId, (p) => {
 		const models = Array.isArray(p.models) ? p.models : [];
-		for (const id of fresh) models.push(buildModelEntry(id, { reasoning: "xhigh", vision: true }));
+		for (const id of fresh) {
+			models.push(openCodeFree ? buildOpenCodeFreeModelEntry(id) : buildModelEntry(id, { reasoning: "xhigh", vision: true }));
+		}
 		p.models = models;
 		return true;
 	});
@@ -1576,10 +1652,10 @@ async function addOpenCodeFreeFlow(ctx: CommandContext) {
 
 	// Probe live models, filter free-tier.
 	ctx.ui.notify("Probing OpenCode Zen models…", "info");
-	const freeIds = await probeOpenCodeFreeModels();
+	const freeIds = await probeOpenCodeFreeModels(sessionId);
 
 	if (freeIds.length === 0) {
-		ctx.ui.notify("No free models found at /zen/v1/models. The endpoint may be unavailable. Try again later.", "error");
+		ctx.ui.notify("No free models found at /inference/v1/models. The endpoint may be unavailable. Try again later.", "error");
 		return;
 	}
 
@@ -1595,24 +1671,17 @@ async function addOpenCodeFreeFlow(ctx: CommandContext) {
 	);
 	if (!selected || selected.length === 0) return;
 
-	// Build provider config with free-tier fingerprint headers.
+	// Build provider config with the free-tier fingerprint headers.
 	// Provider config shape: { baseUrl, api, apiKey?, headers?, models[] }.
+	// NOTE: headers alone are not enough — the gateway also requires the CLI
+	// `<env>` marker and `read`/`shell` tools in every request body; the
+	// before_provider_request hook (registerOpenCodeFingerprintHook) adds them.
 	const config: Record<string, unknown> = {
 		baseUrl: OPENCODE_ZEN_ENDPOINT,
 		api: "openai-completions",
 		apiKey: "public",
-		headers: {
-			"User-Agent": "opencode/1.18.31",
-			"x-opencode-client": "desktop",
-			"x-opencode-project": "global",
-			"x-opencode-session": sessionId,
-		},
-		models: selected.map((id) => ({
-			id,
-			input: ["text", "image"],
-			reasoning: true,
-			thinkingLevelMap: { xhigh: "xhigh" },
-		})),
+		headers: opencodeFreeHeaders(sessionId),
+		models: selected.map((id) => buildOpenCodeFreeModelEntry(id)),
 	};
 
 	if (!(await persistProvider(ctx, providerId, config))) return;
@@ -1812,7 +1881,220 @@ async function collectModelIds(
 	}
 }
 
+// ── OpenCode Free: companion `shell` tool ─────────────────────────────────────
+// The free-tier gateway requires every request body to declare lowercase `read`
+// and `shell` tools (name-only check; the params schema must have non-empty
+// properties). The host toolset already sends `read` but not `shell`, so
+// register a real passthrough over ctx.exec so a model that calls it still
+// does something useful.
+async function registerShellTool(pi: ExtensionAPI): Promise<void> {
+	if (typeof pi.registerTool !== "function") return;
+	try {
+		pi.registerTool({
+			name: "shell",
+			label: "Shell",
+			description: "Execute a shell command and return its output. Prefer dedicated tools over shell commands when possible.",
+			parameters: {
+				type: "object",
+				properties: { command: { type: "string", description: "Shell command string to execute" } },
+				required: ["command"],
+			},
+			approval: "exec",
+			execute: async (_id, params, signal, _onUpdate, ctx) => {
+				const command = typeof params.command === "string" ? params.command.trim() : "";
+				if (!command) {
+					return { output: "No command provided.", isError: true };
+				}
+				try {
+					const result = await ctx.exec(command, [], { signal });
+					const output = result.stderr.trim()
+						? `${result.stdout}\n${result.stderr}`.trim()
+						: result.stdout;
+					return { output: output || "(no output)", isError: result.code !== 0 };
+				} catch (error) {
+					return {
+						output: `shell failed: ${error instanceof Error ? error.message : String(error)}`,
+						isError: true,
+					};
+				}
+			},
+		});
+	} catch {
+		// Registration is best-effort: without it the free tier 403s, but the
+		// wizard and every other feature keep working.
+	}
+}
+
+// ── OpenCode Free: `<env>` marker + tool declaration hook ─────────────────────
+// The free gateway answers 429 FreeUsageLimitError unless BOTH halves of the CLI
+// fingerprint are in the request body: the `<env>` marker in the effective system
+// prompt AND tools declaring `read` and `shell` (9router ce060c79 / PR #5222;
+// verified live 2026-10-27: the identical body without the marker 429s, with it
+// 200s). pi/omp sends no marker, and auxiliary turns may ship no tools at all, so
+// this hook repairs free-lane requests only.
+
+type ChatTextBlock = { text: string };
+type ChatMessage = { role?: string; content?: unknown };
+type ChatTool = {
+	type: string;
+	function: { name: string; description: string; parameters: Record<string, unknown> };
+};
+type ChatPayload = { model?: unknown; messages?: ChatMessage[]; tools?: ChatTool[]; tool_choice?: unknown };
+
+const OPENCODE_FREE_TOOL_STUBS: ChatTool[] = [
+	{
+		type: "function",
+		function: {
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+		},
+	},
+	{
+		type: "function",
+		function: {
+			name: "shell",
+			description: "Execute a shell command",
+			parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+		},
+	},
+];
+
+function isChatPayload(value: unknown): value is ChatPayload {
+	return typeof value === "object" && value !== null && "messages" in value && Array.isArray(value.messages);
+}
+
+function isTextBlock(value: unknown): value is ChatTextBlock {
+	return typeof value === "object" && value !== null && "text" in value && typeof value.text === "string";
+}
+
+function opencodeEnvMarker(cwd: string): string {
+	return [
+		"Here is some useful information about the environment you are running in:",
+		"<env>",
+		`  Working directory: ${cwd}`,
+		`  Workspace root folder: ${cwd}`,
+		"  Is directory a git repo: no",
+		`  Platform: ${process.platform}`,
+		`  Prefer ${join(tmpdir(), "opencode")} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
+		"</env>",
+	].join("\n");
+}
+
+function hasEnvMarker(content: unknown): boolean {
+	if (typeof content === "string") return content.includes("<env>");
+	if (!Array.isArray(content)) return false;
+	return content.some((block) => isTextBlock(block) && block.text.includes("<env>"));
+}
+
+function withEnvMarker(content: unknown, marker: string): unknown {
+	if (typeof content === "string") return content.trim() ? `${content}\n\n${marker}` : marker;
+	if (Array.isArray(content)) {
+		const blocks = [...content];
+		for (let i = blocks.length - 1; i >= 0; i--) {
+			const block = blocks[i];
+			if (!isTextBlock(block)) continue;
+			blocks[i] = { ...block, text: block.text.trim() ? `${block.text}\n\n${marker}` : marker };
+			return blocks;
+		}
+		return [...blocks, { type: "text", text: marker }];
+	}
+	return marker;
+}
+
+function applyOpenCodeFingerprint(payload: ChatPayload, cwd: string): void {
+	const messages = payload.messages ?? [];
+	const systemIndex = messages.findIndex((message) => message?.role === "system");
+	if (systemIndex < 0) {
+		payload.messages = [{ role: "system", content: opencodeEnvMarker(cwd) }, ...messages];
+	} else if (!hasEnvMarker(messages[systemIndex]?.content)) {
+		messages[systemIndex] = {
+			...messages[systemIndex],
+			content: withEnvMarker(messages[systemIndex].content, opencodeEnvMarker(cwd)),
+		};
+	}
+
+	const tools = Array.isArray(payload.tools) ? payload.tools : [];
+	const declared = new Set(tools.map((tool) => tool.function?.name));
+	for (const stub of OPENCODE_FREE_TOOL_STUBS) {
+		if (!declared.has(stub.function.name)) tools.push(structuredClone(stub));
+	}
+	payload.tools = tools;
+	// Upstream answers tool_choice "none" with 403 FreeTierError.
+	if (payload.tool_choice === "none") delete payload.tool_choice;
+}
+
+type OpenCodeFreeTargets = { providerIds: Set<string>; modelIds: Set<string> };
+let opencodeTargetsCache: { stamp: string; targets: OpenCodeFreeTargets } | undefined;
+
+function opencodeFreeTargets(): OpenCodeFreeTargets {
+	const empty: OpenCodeFreeTargets = { providerIds: new Set(), modelIds: new Set() };
+	let stamp: string;
+	try {
+		const stat = statSync(MODELS_JSON_PATH);
+		stamp = `${stat.mtimeMs}:${stat.size}`;
+	} catch {
+		return empty;
+	}
+	if (opencodeTargetsCache?.stamp === stamp) return opencodeTargetsCache.targets;
+
+	try {
+		const providers: unknown = loadModelsConfig().providers ?? {};
+		if (typeof providers !== "object" || providers === null) return empty;
+		const providerIds = new Set<string>();
+		const modelIds = new Set<string>();
+		for (const [id, provider] of Object.entries(providers)) {
+			if (typeof provider !== "object" || provider === null) continue;
+			const baseUrl = "baseUrl" in provider && typeof provider.baseUrl === "string" ? provider.baseUrl : "";
+			if (!OPENCODE_FREE_BASE_URL_RE.test(baseUrl)) continue;
+			providerIds.add(id);
+			const models = "models" in provider && Array.isArray(provider.models) ? provider.models : [];
+			for (const model of models) {
+				if (typeof model === "string") {
+					modelIds.add(model);
+					continue;
+				}
+				if (typeof model !== "object" || model === null || !("id" in model) || typeof model.id !== "string") continue;
+				modelIds.add(model.id);
+			}
+		}
+		opencodeTargetsCache = { stamp, targets: { providerIds, modelIds } };
+		return opencodeTargetsCache.targets;
+	} catch {
+		// Unreadable config: never rewrite unrelated provider requests.
+		return empty;
+	}
+}
+
+function registerOpenCodeFingerprintHook(pi: ExtensionAPI): void {
+	if (typeof pi.on !== "function") return;
+	pi.on("before_provider_request", (event, ctx) => {
+		try {
+			const payload = event.payload;
+			// Chat shape only: Claude-shaped bodies carry a top-level `system`,
+			// where a role:"system" message would be rejected.
+			if (!isChatPayload(payload) || "system" in payload) return undefined;
+			const targets = opencodeFreeTargets();
+			if (targets.providerIds.size === 0) return undefined;
+
+			const matchesProvider =
+				typeof ctx.model?.provider === "string" && targets.providerIds.has(ctx.model.provider);
+			const matchesModel = typeof payload.model === "string" && targets.modelIds.has(payload.model);
+			if (!matchesProvider && !matchesModel) return undefined;
+
+			applyOpenCodeFingerprint(payload, ctx.cwd);
+			return payload;
+		} catch {
+			return undefined;
+		}
+	});
+}
+
 export default function betterCustomWizard(pi: ExtensionAPI) {
+	void registerShellTool(pi);
+	registerOpenCodeFingerprintHook(pi);
+
+
 	pi.registerCommand("better-custom", {
 		description: "Wizard for adding, editing, or deleting custom providers in ~/.pi/agent/models.json",
 		handler: async (_args, ctx) => {
