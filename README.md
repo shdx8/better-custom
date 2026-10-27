@@ -81,6 +81,10 @@ steps and instead probes OpenCode Zen for free-tier models:
 - Registers a request hook that stamps the CLI `<env>` block into the system
   prompt and guarantees `read` + `shell` tool declarations — without both halves
   the gateway answers `429 FreeUsageLimitError` even with correct headers
+- Distinguishing 429s: the free lane's daily quota is per egress IP, resets at
+  00:00 UTC, and answers with a `retry-after` of hours. The fingerprint gate
+  answers 429 with no `retry-after`. Since there is no API key, a proxy is the
+  only way around an exhausted quota
 
 ### Edit a provider
 
